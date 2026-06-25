@@ -16,6 +16,9 @@ from torch.nn.parameter import Parameter
 from typing import Any, Optional, Tuple, Union
 import math
 
+from .loopvit_bridge import LoopViTVisionWithBridge, load_visual_projection_from_lightning_ckpt
+from .standardvit_bridge import StandardViTVisionWithBridge, load_visual_proj_from_standard_ckpt
+
 
 class Modified_CLIPVisionEmbeddings(nn.Module):
     def __init__(self, clip_embed):
@@ -654,25 +657,46 @@ class HiVG(nn.Module):
         print("init HiVG model...")
         if (args.model == "ViT-L/14-336"):
             print("init CLIP ViT-L/14-336")
-            self.clip = CLIPModel.from_pretrained("/path_to_clip/clip-vit-large-patch14-336")
+            self.clip = CLIPModel.from_pretrained("openai/clip-vit-large-patch14-336")
             self.extract_vision_layer = [12, 16, 20, 24]  # v4
             self.adapt_layer = [11, 15, 19, 23]
             self.patch_size = 14
         elif (args.model == "ViT-L/14"):  # main large model
             print("init CLIP ViT-L/14")
-            self.clip = CLIPModel.from_pretrained("/path_to_clip/clip-vit-large-patch14")
+            self.clip = CLIPModel.from_pretrained("openai/clip-vit-large-patch14")
             self.extract_vision_layer = [6, 12, 18, 24]  # final 版本
             self.adapt_layer = [] if args.warmup is True else [4, 10, 16, 22]  # large model is trained on two phrases
             self.patch_size = 14
         elif (args.model == "ViT-B/32"):
             print("init CLIP ViT-B/32")
-            self.clip = CLIPModel.from_pretrained("/path_to_clip/clip-vit-base-patch32")
+            self.clip = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
             self.extract_vision_layer = [1, 4, 8, 12]
             self.adapt_layer = [0, 3, 7, 11]
             self.patch_size = 32
+        elif (args.model == "LoopViT"):
+            # Vision tower is replaced below (after self.clip.vision_model
+            # gets frozen) with a LoopViT backbone -- this CLIPModel only
+            # supplies the text tower (text_model/text_projection/logit_scale)
+            # and scaffolding (visual_projection gets overwritten too, from
+            # the LoopViT checkpoint's own visual_proj, see below).
+            print("init LoopViT (loop_core_depth=1, single shared block)")
+            self.clip = CLIPModel.from_pretrained("openai/clip-vit-base-patch16")
+            self.extract_vision_layer = [1, 4, 8, 12]
+            self.adapt_layer = [0, 3, 7, 11]
+            self.patch_size = 16
+        elif (args.model == "StandardViT-Distilled"):
+            # Vision tower is replaced below with a wrapper around open_clip's
+            # native ViT-B-16 (the architecture clip-kd-snn's standard, non-loop
+            # CLIP-KD student actually uses) -- the comparison arm for LoopViT,
+            # same bridges/recipe/text tower, differing only in vision backbone.
+            print("init StandardViT-Distilled (open_clip-native ViT-B/16)")
+            self.clip = CLIPModel.from_pretrained("openai/clip-vit-base-patch16")
+            self.extract_vision_layer = [1, 4, 8, 12]
+            self.adapt_layer = [0, 3, 7, 11]
+            self.patch_size = 16
         else:  # default base model
             print("init CLIP ViT-B/16")
-            self.clip = CLIPModel.from_pretrained("/path_to_clip/clip-vit-base-patch16")
+            self.clip = CLIPModel.from_pretrained("openai/clip-vit-base-patch16")
             """
              Note that there is no mistake here. Note that [1, 4, 8, 12], [0, 3, 7, 11] are the same layer.
              In the internal implementation of transformers, the index at vision branch [0] is the original
@@ -706,9 +730,36 @@ class HiVG(nn.Module):
             parameter.requires_grad_(False)
 
         print("adapt_layer: ", self.adapt_layer)
-        self.clip.vision_model = CLIP_Vision_Model_with_Crossmodal_Bridge(args, self.clip.vision_model,
-                                                                          self.adapt_layer, self.extract_text_layer,
-                                                                          self.clip.text_model.config)
+        if args.model == "LoopViT":
+            self.clip.vision_model = LoopViTVisionWithBridge(
+                args, self.extract_text_layer, self.clip.text_model.config.hidden_size
+            )
+            # The blanket freeze above ran before this swap, against the
+            # now-discarded pretrained CLIPVisionModel -- freeze the LoopViT
+            # backbone explicitly; the bridges stay trainable (default
+            # requires_grad=True on freshly constructed params), unfrozen
+            # again below for parity with the non-LoopViT branches' pattern.
+            for p in self.clip.vision_model.loopvit.parameters():
+                p.requires_grad_(False)
+            loopvit_checkpoint = getattr(args, "loopvit_checkpoint", "")
+            if loopvit_checkpoint:
+                load_visual_projection_from_lightning_ckpt(loopvit_checkpoint, self.clip.visual_projection)
+        elif args.model == "StandardViT-Distilled":
+            self.clip.vision_model = StandardViTVisionWithBridge(
+                args, self.extract_text_layer, self.clip.text_model.config.hidden_size
+            )
+            # The blanket freeze above ran against the now-discarded
+            # pretrained CLIPVisionModel -- freeze the new backbone explicitly
+            # (bridges stay trainable, opened again below for parity).
+            for p in self.clip.vision_model.visual.parameters():
+                p.requires_grad_(False)
+            standardvit_checkpoint = getattr(args, "standardvit_checkpoint", "")
+            if standardvit_checkpoint:
+                load_visual_proj_from_standard_ckpt(standardvit_checkpoint, self.clip.visual_projection)
+        else:
+            self.clip.vision_model = CLIP_Vision_Model_with_Crossmodal_Bridge(args, self.clip.vision_model,
+                                                                              self.adapt_layer, self.extract_text_layer,
+                                                                              self.clip.text_model.config)
 
         """
             Note that the essence of the HiLoRA mechanism is a process of decomposing parameter learning, and its
@@ -718,7 +769,12 @@ class HiVG(nn.Module):
         """
         self.set_HiLoRA(args)
 
-        if True:
+        if args.model in ("LoopViT", "StandardViT-Distilled"):
+            print("Open Multi-layer Adaptive Cross-modal Bridge parameters (bridges) ...")
+            for name, param in self.clip.vision_model.bridges.named_parameters():
+                print("param name: ", name)
+                param.requires_grad_(True)
+        else:
             print("Open Multi-layer Adaptive Cross-modal Bridge parameters ...")
             for name, param in self.clip.vision_model.encoder.layers.named_parameters():
                 if "cross_attn" in str(name).split(".") or "cross_norm" in str(name).split(".") \
@@ -767,6 +823,37 @@ class HiVG(nn.Module):
                                             padding=(0, 0), output_padding=(0, 0), bias=False)  # bias=False
 
     def set_HiLoRA(self, args):
+        if args.model == "LoopViT":
+            # loop_core_depth=1 -> one physical TransformerBlock reused at
+            # every loop step, so there is exactly one unique block to LoRA-
+            # patch -- HiVG's literal 3-stage hierarchical curriculum below
+            # (gating requires_grad by layer-index substring across 12
+            # distinct CLIP layers) is degenerate here and is skipped
+            # entirely, along with peft/get_peft_model (its target_modules
+            # list, q_proj/k_proj/v_proj/out_proj, doesn't match LoopViT's
+            # fused qkv/proj attention module names anyway). Text tower stays
+            # untouched (frozen, no LoRA) -- single adapter is vision-only.
+            rank = int(getattr(args, "loopvit_lora_rank", 32))
+            alpha = float(getattr(args, "loopvit_lora_alpha", 16.0))
+            trainable = args.hi_lora_stage >= 1
+            self.clip.vision_model.patch_lora(rank=rank, alpha=alpha, trainable=trainable)
+            print(f"[LoopViT] single LoRA adapter rank={rank} alpha={alpha} trainable={trainable}")
+            return
+
+        if args.model == "StandardViT-Distilled":
+            # 12 distinct blocks -> genuine cumulative HiLoRA curriculum
+            # (5/8/12 blocks at stages 1/2/3, via hilora.py's blocks_for_stage)
+            # applies here, unlike LoopViT's degenerate single-adapter case.
+            # peft/get_peft_model is skipped for the same reason as LoopViT:
+            # its target_modules (q_proj/k_proj/v_proj/out_proj) don't match
+            # open_clip's fused nn.MultiheadAttention. Text tower stays
+            # untouched (frozen, no LoRA) -- adapters are vision-only.
+            rank = int(getattr(args, "standardvit_lora_rank", 32))
+            alpha = float(getattr(args, "standardvit_lora_alpha", 16.0))
+            self.clip.vision_model.patch_lora_stage(args.hi_lora_stage, rank=rank, alpha=alpha)
+            print(f"[StandardViT-Distilled] HiLoRA stage={args.hi_lora_stage} rank={rank} alpha={alpha}")
+            return
+
         open_lora = True
         close_lora_parameter_update = False
         close_lora_vision_parameter_update = False

@@ -87,6 +87,23 @@ def get_args_parser():
     parser.add_argument('--seed', default=13, type=int)
     parser.add_argument('--resume', default='', help='resume from checkpoint')
     parser.add_argument('--detr_model', default='./saved_models/detr-r50.pth', type=str, help='detr model')
+    parser.add_argument('--loopvit_checkpoint', default='', type=str,
+                        help="path to a CLIP-KD Lightning .ckpt to load the LoopViT backbone "
+                             "(visual + visual_proj) from, when --model LoopViT. Not needed if "
+                             "--eval_model already contains the fine-tuned LoopViT weights.")
+    parser.add_argument('--loopvit_max_loop_steps', default=12, type=int,
+                        help="number of recurrent passes through the single shared LoopViT block")
+    parser.add_argument('--loopvit_lora_rank', default=32, type=int, help='rank of the single LoopViT LoRA adapter')
+    parser.add_argument('--loopvit_lora_alpha', default=16.0, type=float,
+                        help='alpha of the single LoopViT LoRA adapter')
+    parser.add_argument('--standardvit_checkpoint', default='', type=str,
+                        help="path to a CLIP-KD Lightning .ckpt to load the standard (open_clip-native) "
+                             "ViT-B/16 backbone (visual + visual.proj) from, when --model StandardViT-Distilled. "
+                             "Not needed if --eval_model already contains the fine-tuned weights.")
+    parser.add_argument('--standardvit_lora_rank', default=32, type=int,
+                        help='rank of the StandardViT-Distilled HiLoRA adapters')
+    parser.add_argument('--standardvit_lora_alpha', default=16.0, type=float,
+                        help='alpha of the StandardViT-Distilled HiLoRA adapters')
     parser.add_argument('--bert_model', default='bert-base-uncased', type=str, help='bert model')
     parser.add_argument('--light', dest='light', default=False, action='store_true', help='if use smaller model')
     parser.add_argument('--start_epoch', default=0, type=int, metavar='N', help='start epoch')
@@ -155,7 +172,7 @@ def main(args):
     data_loader_test = DataLoader(dataset_test, args.batch_size, sampler=sampler_test,
                                   drop_last=False, collate_fn=utils.collate_fn, num_workers=args.num_workers)
 
-    checkpoint = torch.load(args.eval_model, map_location='cpu')
+    checkpoint = torch.load(args.eval_model, map_location='cpu', weights_only=False)
     missing_keys, unexpected_keys = model_without_ddp.load_state_dict(checkpoint['model'], strict=False)
     # print('Missing keys when loading stage model: \n', missing_keys)
     # print('Unexpected additional keys when loading stage model: \n', unexpected_keys)

@@ -114,6 +114,21 @@ def get_args_parser():
     parser.add_argument('--seed', default=13, type=int)
     parser.add_argument('--resume', default='', help='resume from checkpoint')
     parser.add_argument('--clip_model', default='', type=str, help='clip model')
+    parser.add_argument('--loopvit_checkpoint', default='', type=str,
+                        help="path to a CLIP-KD Lightning .ckpt to load the LoopViT backbone "
+                             "(visual + visual_proj) from, when --model LoopViT")
+    parser.add_argument('--loopvit_max_loop_steps', default=12, type=int,
+                        help="number of recurrent passes through the single shared LoopViT block")
+    parser.add_argument('--loopvit_lora_rank', default=32, type=int, help='rank of the single LoopViT LoRA adapter')
+    parser.add_argument('--loopvit_lora_alpha', default=16.0, type=float,
+                        help='alpha of the single LoopViT LoRA adapter')
+    parser.add_argument('--standardvit_checkpoint', default='', type=str,
+                        help="path to a CLIP-KD Lightning .ckpt to load the standard (open_clip-native) "
+                             "ViT-B/16 backbone (visual + visual.proj) from, when --model StandardViT-Distilled")
+    parser.add_argument('--standardvit_lora_rank', default=32, type=int,
+                        help='rank of the StandardViT-Distilled HiLoRA adapters')
+    parser.add_argument('--standardvit_lora_alpha', default=16.0, type=float,
+                        help='alpha of the StandardViT-Distilled HiLoRA adapters')
     parser.add_argument('--bert_model', default='bert-base-uncased', type=str, help='bert model')
     parser.add_argument('--light', dest='light', default=False, action='store_true', help='if use smaller model')
     parser.add_argument('--start_epoch', default=0, type=int, metavar='N', help='start epoch')
@@ -218,7 +233,7 @@ def main(args):
                                  drop_last=False, collate_fn=utils.collate_fn, num_workers=args.num_workers)
 
     if args.clip_model != "":
-        checkpoint = torch.load(args.clip_model, map_location='cpu')
+        checkpoint = torch.load(args.clip_model, map_location='cpu', weights_only=False)
         print("\nmodel structures: \n", model_without_ddp.clip)
         missing_keys, unexpected_keys = model_without_ddp.clip.load_state_dict(checkpoint['model'], strict=False)
         print('Missing keys when loading lora fine-tuned clip model:')
@@ -229,19 +244,29 @@ def main(args):
     best_accu = 0
     if args.hi_lora_stage and not args.resume:
         print("hi_lora_stage, load last stage model")
-        checkpoint = torch.load(args.hi_lora_retrain, map_location='cpu')
+        checkpoint = torch.load(args.hi_lora_retrain, map_location='cpu', weights_only=False)
         missing_keys, unexpected_keys = model_without_ddp.load_state_dict(checkpoint['model'], strict=False)
         # print('Missing keys when loading stage model: \n', missing_keys)
         # print('Unexpected additional keys when loading stage model: \n', unexpected_keys)
-        print("hi_lora_stage, load clip model")
-        checkpoint = torch.load(args.hi_lora_clip, map_location='cpu')
-        # TODO: In the new HiLoRA stage, the CLIP model has changed, and the CLIP parameters from the previous stage
-        #  can no longer be loaded. They need to be loaded separately
-        missing_keys, unexpected_keys = model_without_ddp.clip.model.load_state_dict(checkpoint['model'], strict=False)
-        print('Missing keys when loading lora fine-tuned clip model:')
-        print(missing_keys)
-        print('Unexpected additional keys when loading lora fine-tuned clip model:')
-        print(unexpected_keys)
+        if args.model not in ("LoopViT", "StandardViT-Distilled"):
+            # Non-LoopViT/StandardViT-Distilled branches re-wrap self.clip in a
+            # fresh nested PeftModel every stage (set_HiLoRA calls
+            # get_peft_model again each time), so self.clip needs a separate
+            # same-stage-shaped reload here. LoopViT's and StandardViT-
+            # Distilled's set_HiLoRA never re-wrap self.clip (no peft involved
+            # -- see models/loopvit_bridge.py / standardvit_bridge.py), so the
+            # full-model load above already covers vision_model/bridges/LoRA;
+            # reloading via .clip.model would raise AttributeError since
+            # self.clip stays a plain CLIPModel.
+            print("hi_lora_stage, load clip model")
+            checkpoint = torch.load(args.hi_lora_clip, map_location='cpu', weights_only=False)
+            # TODO: In the new HiLoRA stage, the CLIP model has changed, and the CLIP parameters from the previous stage
+            #  can no longer be loaded. They need to be loaded separately
+            missing_keys, unexpected_keys = model_without_ddp.clip.model.load_state_dict(checkpoint['model'], strict=False)
+            print('Missing keys when loading lora fine-tuned clip model:')
+            print(missing_keys)
+            print('Unexpected additional keys when loading lora fine-tuned clip model:')
+            print(unexpected_keys)
         val_stats = validate(args, model, data_loader_val, device)
         best_accu = val_stats['accu']
         print("best_accu: ", best_accu)
@@ -260,14 +285,14 @@ def main(args):
         print("HiLoRA CLIP checkpoint saved!")
 
     if args.retrain:
-        checkpoint = torch.load(args.retrain, map_location='cpu')
+        checkpoint = torch.load(args.retrain, map_location='cpu', weights_only=False)
         model_without_ddp.load_state_dict(checkpoint['model'], strict=False)
         val_stats = validate(args, model, data_loader_val, device)
         best_accu = val_stats['accu']
         print("best_accu: ", best_accu)
 
     if args.resume:
-        checkpoint = torch.load(args.resume, map_location='cpu')
+        checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
         model_without_ddp.load_state_dict(checkpoint['model'])
         if not args.eval and 'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint:
             optimizer.load_state_dict(checkpoint['optimizer'])
