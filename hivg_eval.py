@@ -133,6 +133,10 @@ def get_args_parser():
 
 
 def main(args):
+    run_timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    if args.output_dir:
+        args.output_dir = os.path.join(args.output_dir, run_timestamp)
+        Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     utils.init_distributed_mode(args)
     print("git:\n  {}\n".format(utils.get_sha()))
 
@@ -185,7 +189,7 @@ def main(args):
     eval_model = eval_model.split('/')[-1].split('.')[0]
     output_dir = Path(args.output_dir)
     if args.output_dir and utils.is_main_process():
-        with (output_dir / "eval_{}_{}_{}_log.txt".format(args.dataset, args.eval_set, eval_model)).open("a") as f:
+        with (output_dir / "eval_{}_{}_{}_{}_log.txt".format(args.dataset, args.eval_set, eval_model, run_timestamp)).open("a") as f:
             f.write(str(args) + "\n")
             f.flush()
 
@@ -204,7 +208,7 @@ def main(args):
                      }
         print(log_stats)
         if args.output_dir and utils.is_main_process():
-            with (output_dir / "eval_{}_{}_{}_log.txt".format(args.dataset, args.eval_set, eval_model)).open("a") as f:
+            with (output_dir / "eval_{}_{}_{}_{}_log.txt".format(args.dataset, args.eval_set, eval_model, run_timestamp)).open("a") as f:
                 f.write(json.dumps(log_stats) + "\n")
 
     if args.save_hilora_clip:

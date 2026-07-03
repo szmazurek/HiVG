@@ -348,7 +348,11 @@ In this case, the performance may be degraded.
         └── eval_mixup_grounding_pretraining_large.sh
     ```
 
-3. You just need to change ```$/path_to_split```, ``` $/path_to_image_data```, ``` $/path_to_output``` to your own file directory to execute the above command.
+3. All the scripts under `train_and_eval_script/` read their data/split/checkpoint/output paths from `HiVG/.env` instead of hardcoding them. Copy the template once and fill in your own paths:
+    ```
+    cp .env.example .env
+    # then edit .env: DATA_ROOT, SPLIT_ROOT, CLIP_CKPT, CLIP_CKPT_LARGE, OUT_ROOT, ...
+    ```
    We strongly recommend to use the following commands to training or testing with different datasets and splits, which will significant reduce the training workforce. Such as:
     ```
     bash train_and_eval_script/eval_single_dataset_finetuning_base.sh
@@ -356,7 +360,7 @@ In this case, the performance may be degraded.
 
 4. For a specific dataset, the instruction is just like follows:
     ```
-    CUDA_VISIBLE_DEVICES=1,2,3,4,5,6,7 python -m torch.distributed.launch --nproc_per_node=7 --master_port 28888 --use_env hivg_eval.py --num_workers 2 --batch_size 60  --dataset unc           --vl_hidden_dim 512 --imsize 224 --max_query_len 77 --normalize_before --enable_adaptive_weights --use_mask_loss  --save_hilora_clip --hi_lora_stage 3 --data_root /path_to_image_data --split_root /path_to_split/ref_data_shuffled --eval_model /patch_to_output/finetuning_base/unc/best_checkpoint.pth      --eval_set testA  --output_dir /patch_to_output/finetuning_base/unc;
+    CUDA_VISIBLE_DEVICES=1,2,3,4,5,6,7 python -m torch.distributed.launch --nproc_per_node=7 --master_port 28888 --use_env hivg_eval.py --num_workers 2 --batch_size 60  --dataset unc           --vl_hidden_dim 512 --imsize 224 --max_query_len 77 --normalize_before --enable_adaptive_weights --use_mask_loss  --save_hilora_clip --hi_lora_stage 3 --data_root $DATA_ROOT --split_root $SPLIT_ROOT --eval_model $OUT_ROOT/finetuning_base/unc/best_checkpoint.pth      --eval_set testA  --output_dir $OUT_ROOT/finetuning_base/unc;
     ```
     Please refer to the files in [train_and_eval_script](train_and_eval_script) for evaluation commands on other splits or datasets under different settings.
 
@@ -376,7 +380,11 @@ In this case, the performance may be degraded.
         └── train_mixup_grounding_pretraining_large.sh
     ```
 
-3. You just need to change ```$/path_to_split```, ``` $/path_to_image_data```, ``` $/path_to_output``` to your own file directory to execute the above command.
+3. All the scripts under `train_and_eval_script/` read their data/split/checkpoint/output paths from `HiVG/.env` instead of hardcoding them. Copy the template once and fill in your own paths:
+    ```
+    cp .env.example .env
+    # then edit .env: DATA_ROOT, SPLIT_ROOT, CLIP_CKPT, CLIP_CKPT_LARGE, OUT_ROOT, ...
+    ```
    We strongly recommend to use the following commands to training or testing with different datasets and splits, which will significant reduce the training workforce. Such as:
     ```
     bash train_and_eval_script/train_single_dataset_finetuning_base.sh

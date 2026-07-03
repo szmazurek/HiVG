@@ -45,7 +45,8 @@ def get_args_parser():
     parser.add_argument('--extract_layer', default=0, type=int)
     parser.add_argument('--warmup', action='store_true', help="If true, vision adapt layer is null")
 
-    parser.add_argument('--dilation', action='store_true',
+    parser.add_argument('--dilatio' \
+    'n', action='store_true',
                         help="If true, we replace stride with dilation in the last convolutional block (DC5)")
     parser.add_argument('--position_embedding', default='sine', type=str, choices=('sine', 'learned'),
                         help="Type of positional embedding to use on top of the image features")
@@ -141,6 +142,10 @@ def get_args_parser():
 
 
 def main(args):
+    run_timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    if args.output_dir:
+        args.output_dir = os.path.join(args.output_dir, run_timestamp)
+        Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     utils.init_distributed_mode(args)
     print("git:\n  {}\n".format(utils.get_sha()))
 
@@ -304,7 +309,7 @@ def main(args):
         print("best_accu: {}".format(best_accu))
 
     if args.output_dir and utils.is_main_process():
-        with open(os.path.join(args.output_dir, "log.txt"), "a") as f:
+        with open(os.path.join(args.output_dir, f"log_{run_timestamp}.txt"), "a") as f:
             f.write(str(args) + "\n")
 
     print("Start training...")
@@ -323,7 +328,7 @@ def main(args):
                      'n_parameters': n_parameters}
         print(log_stats)
         if args.output_dir and utils.is_main_process():
-            with open(os.path.join(args.output_dir, "log.txt"), "a") as f:
+            with open(os.path.join(args.output_dir, f"log_{run_timestamp}.txt"), "a") as f:
                 f.write(json.dumps(log_stats) + "\n")
 
         if args.output_dir:

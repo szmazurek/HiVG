@@ -117,15 +117,14 @@ class LoopViTVisionWithBridge(nn.Module):
             load_submodule_from_lightning_ckpt(loopvit_checkpoint, self.loopvit, "visual", strict=True)
 
     def patch_lora(self, rank: int, alpha: float, trainable: bool) -> None:
-        """Single LoRA adapter on the one shared TransformerBlock.
+        """Single LoRA adapter (q/k/v/out_proj) on the one shared TransformerBlock.
 
-        loop_core_depth=1 means every block-execution reuses the same
-        nn.Module, so there is exactly one unique block to patch -- HiVG's
-        literal 3-stage hierarchical LoRA curriculum is degenerate here (see
-        bvit_d1.yaml's documented note on this).
+        loop_core_depth=1: every block-execution reuses the same nn.Module, so
+        there is exactly one unique block to patch.  Text tower is handled by
+        set_HiLoRA in HiVG.py after this call.
         """
         block = next(self.loopvit.iter_blocks())
-        patch_block_with_lora(block, rank=rank, alpha=alpha)
+        patch_block_with_lora(block, rank=rank, alpha=alpha, dropout=0.1)
         set_lora_trainable([block], trainable)
 
     def forward(

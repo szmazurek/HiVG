@@ -246,7 +246,7 @@ class TransVGDataset(data.Dataset):
         for split in splits:
             imgset_file = '{0}_{1}.pth'.format(self.dataset, split)
             imgset_path = osp.join(dataset_path, imgset_file)
-            self.images += torch.load(imgset_path)
+            self.images += torch.load(imgset_path, weights_only=False)
 
         # if self.prompt_template:
         #     self.images = self.prompt(self.images)

@@ -19,6 +19,9 @@ import math
 from .loopvit_bridge import LoopViTVisionWithBridge, load_visual_projection_from_lightning_ckpt
 from .standardvit_bridge import StandardViTVisionWithBridge, load_visual_proj_from_standard_ckpt
 
+# loopvit_bridge already added _REPO_ROOT to sys.path as a side-effect of import
+from src.downstream.models.hilora import patch_block_with_lora as _hil_patch, set_lora_trainable as _hil_set_trainable
+
 
 class Modified_CLIPVisionEmbeddings(nn.Module):
     def __init__(self, clip_embed):
@@ -824,34 +827,32 @@ class HiVG(nn.Module):
 
     def set_HiLoRA(self, args):
         if args.model == "LoopViT":
-            # loop_core_depth=1 -> one physical TransformerBlock reused at
-            # every loop step, so there is exactly one unique block to LoRA-
-            # patch -- HiVG's literal 3-stage hierarchical curriculum below
-            # (gating requires_grad by layer-index substring across 12
-            # distinct CLIP layers) is degenerate here and is skipped
-            # entirely, along with peft/get_peft_model (its target_modules
-            # list, q_proj/k_proj/v_proj/out_proj, doesn't match LoopViT's
-            # fused qkv/proj attention module names anyway). Text tower stays
-            # untouched (frozen, no LoRA) -- single adapter is vision-only.
             rank = int(getattr(args, "loopvit_lora_rank", 32))
             alpha = float(getattr(args, "loopvit_lora_alpha", 16.0))
             trainable = args.hi_lora_stage >= 1
+            # Vision: single adapter on the one shared block (loop_core_depth=1)
             self.clip.vision_model.patch_lora(rank=rank, alpha=alpha, trainable=trainable)
-            print(f"[LoopViT] single LoRA adapter rank={rank} alpha={alpha} trainable={trainable}")
+            print(f"[LoopViT] vision LoRA rank={rank} alpha={alpha} trainable={trainable}")
+            # Text: all 12 HF-CLIP text layers — matching authors' scope (q/k/v/out_proj)
+            text_layers = list(self.clip.text_model.encoder.layers)
+            for layer in text_layers:
+                _hil_patch(layer, rank=rank, alpha=alpha, dropout=0.1)
+            _hil_set_trainable(text_layers, trainable)
+            print(f"[LoopViT] text LoRA {len(text_layers)} layers rank={rank} alpha={alpha} trainable={trainable}")
             return
 
         if args.model == "StandardViT-Distilled":
-            # 12 distinct blocks -> genuine cumulative HiLoRA curriculum
-            # (5/8/12 blocks at stages 1/2/3, via hilora.py's blocks_for_stage)
-            # applies here, unlike LoopViT's degenerate single-adapter case.
-            # peft/get_peft_model is skipped for the same reason as LoopViT:
-            # its target_modules (q_proj/k_proj/v_proj/out_proj) don't match
-            # open_clip's fused nn.MultiheadAttention. Text tower stays
-            # untouched (frozen, no LoRA) -- adapters are vision-only.
             rank = int(getattr(args, "standardvit_lora_rank", 32))
             alpha = float(getattr(args, "standardvit_lora_alpha", 16.0))
+            # Vision: cumulative HiLoRA staging (5/8/12 blocks at stages 1/2/3)
             self.clip.vision_model.patch_lora_stage(args.hi_lora_stage, rank=rank, alpha=alpha)
-            print(f"[StandardViT-Distilled] HiLoRA stage={args.hi_lora_stage} rank={rank} alpha={alpha}")
+            print(f"[StandardViT-Distilled] vision HiLoRA stage={args.hi_lora_stage} rank={rank} alpha={alpha}")
+            # Text: all 12 HF-CLIP text layers — matching authors' scope (q/k/v/out_proj)
+            text_layers = list(self.clip.text_model.encoder.layers)
+            for layer in text_layers:
+                _hil_patch(layer, rank=rank, alpha=alpha, dropout=0.1)
+            _hil_set_trainable(text_layers, args.hi_lora_stage >= 1)
+            print(f"[StandardViT-Distilled] text LoRA {len(text_layers)} layers rank={rank} alpha={alpha}")
             return
 
         open_lora = True

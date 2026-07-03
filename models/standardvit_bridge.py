@@ -116,7 +116,7 @@ class StandardViTVisionWithBridge(nn.Module):
             return
         active_blocks = blocks_for_stage(self, stage)
         for block in active_blocks:
-            patch_block_with_lora(block, rank=rank, alpha=alpha)
+            patch_block_with_lora(block, rank=rank, alpha=alpha, dropout=0.1)
         set_lora_trainable(active_blocks, True)
 
     def forward(
