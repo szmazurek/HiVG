@@ -119,10 +119,38 @@ def get_args_parser():
                         help="path to a CLIP-KD Lightning .ckpt to load the LoopViT backbone "
                              "(visual + visual_proj) from, when --model LoopViT")
     parser.add_argument('--loopvit_max_loop_steps', default=12, type=int,
-                        help="number of recurrent passes through the single shared LoopViT block")
-    parser.add_argument('--loopvit_lora_rank', default=32, type=int, help='rank of the single LoopViT LoRA adapter')
+                        help="number of recurrent passes through the LoopViT core (paired with "
+                             "loopvit_loop_core_depth so depth * steps stays constant at 12)")
+    parser.add_argument('--loopvit_loop_core_depth', default=1, type=int,
+                        help="number of distinct physical TransformerBlocks in the LoopViT core "
+                             "(1/3/6 for the three target configs)")
+    parser.add_argument('--loopvit_loop_mode', default='global', type=str, choices=['global', 'per_block'],
+                        help="'global': all loop_core_depth blocks run once per step, repeated "
+                             "max_loop_steps times (used by the three target configs). 'per_block': "
+                             "each block runs its own loopvit_loop_schedule iteration count sequentially.")
+    parser.add_argument('--loopvit_loop_schedule', default=None,
+                        type=lambda s: [int(x) for x in s.split(',')] if s else None,
+                        help="comma-separated per-block iteration counts, only used when "
+                             "--loopvit_loop_mode per_block (e.g. '1,10,1')")
+    parser.add_argument('--loopvit_lora_rank', default=32, type=int, help='rank of the LoopViT LoRA adapters')
     parser.add_argument('--loopvit_lora_alpha', default=16.0, type=float,
-                        help='alpha of the single LoopViT LoRA adapter')
+                        help='alpha of the LoopViT LoRA adapters')
+    parser.add_argument('--loopvit_looptext_checkpoint', default='', type=str,
+                        help="path to a joint CLIP-KD Lightning .ckpt with both visual (LoopViT) and "
+                             "text_model (LoopText) weights, when --model LoopViT-LoopText")
+    parser.add_argument('--text_width', default=512, type=int, help='LoopText internal transformer width')
+    parser.add_argument('--text_loop_core_depth', default=1, type=int,
+                        help='number of distinct physical TransformerBlocks in the LoopText core '
+                             '(matched to loopvit_loop_core_depth for the symmetric target configs)')
+    parser.add_argument('--text_max_loop_steps', default=12, type=int,
+                        help='number of recurrent passes over the LoopText core')
+    parser.add_argument('--text_num_heads', default=8, type=int)
+    parser.add_argument('--text_mlp_ratio', default=4.0, type=float)
+    parser.add_argument('--text_vocab_size', default=49408, type=int)
+    parser.add_argument('--looptext_lora_rank', default=32, type=int,
+                        help='rank of the flat (non-staged) LoopText LoRA adapters')
+    parser.add_argument('--looptext_lora_alpha', default=16.0, type=float,
+                        help='alpha of the flat (non-staged) LoopText LoRA adapters')
     parser.add_argument('--standardvit_checkpoint', default='', type=str,
                         help="path to a CLIP-KD Lightning .ckpt to load the standard (open_clip-native) "
                              "ViT-B/16 backbone (visual + visual.proj) from, when --model StandardViT-Distilled")
@@ -253,14 +281,15 @@ def main(args):
         missing_keys, unexpected_keys = model_without_ddp.load_state_dict(checkpoint['model'], strict=False)
         # print('Missing keys when loading stage model: \n', missing_keys)
         # print('Unexpected additional keys when loading stage model: \n', unexpected_keys)
-        if args.model not in ("LoopViT", "StandardViT-Distilled"):
-            # Non-LoopViT/StandardViT-Distilled branches re-wrap self.clip in a
-            # fresh nested PeftModel every stage (set_HiLoRA calls
-            # get_peft_model again each time), so self.clip needs a separate
-            # same-stage-shaped reload here. LoopViT's and StandardViT-
-            # Distilled's set_HiLoRA never re-wrap self.clip (no peft involved
-            # -- see models/loopvit_bridge.py / standardvit_bridge.py), so the
-            # full-model load above already covers vision_model/bridges/LoRA;
+        if args.model not in ("LoopViT", "StandardViT-Distilled", "LoopViT-LoopText"):
+            # Non-LoopViT/StandardViT-Distilled/LoopViT-LoopText branches
+            # re-wrap self.clip in a fresh nested PeftModel every stage
+            # (set_HiLoRA calls get_peft_model again each time), so self.clip
+            # needs a separate same-stage-shaped reload here. LoopViT's,
+            # StandardViT-Distilled's, and LoopViT-LoopText's set_HiLoRA never
+            # re-wrap self.clip (no peft involved -- see models/loopvit_bridge.py
+            # / standardvit_bridge.py / looptext_bridge.py), so the full-model
+            # load above already covers vision_model/text_model/bridges/LoRA;
             # reloading via .clip.model would raise AttributeError since
             # self.clip stays a plain CLIPModel.
             print("hi_lora_stage, load clip model")

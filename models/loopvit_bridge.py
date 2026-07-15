@@ -4,14 +4,17 @@ Drop-in replacement for CLIP_Vision_Model_with_Crossmodal_Bridge (see HiVG.py)
 when args.model == "LoopViT": same forward() signature, same returned dict
 shape, so HiVG.forward() needs no changes downstream of vision encoding.
 
-Uses loop_core_depth=1 (one physical TransformerBlock reused for every loop
-step) -- the "single LoRA adapter" assumption documented in
-clip-kd-snn/configs/downstream/model/bvit_d1.yaml. Because the block is the
-*same object* at every injection point, the four cross-modal bridges cannot
-live on the block itself (that would collapse 4 distinct bridges into 1, the
-way HiVG's literal CLIPEncoderLayer_with_Crossmodal_Bridge attaches one bridge
-per distinct CLIP layer) -- they are instead held externally in an
-nn.ModuleList keyed by injection slot, and applied by this wrapper's
+loop_core_depth / max_loop_steps / loop_mode are configurable (default
+depth=1, mode="global", matching clip-kd-snn's configs/downstream/model/
+bvit_d1.yaml). Regardless of depth, block-execution count is always
+max_loop_steps * loop_core_depth = 12 by construction across the three target
+configs (1x12, 3x4, 6x2), so the four cross-modal bridges always inject/extract
+at the same execution indices {1,4,8,12}. Because distinct loop iterations can
+reuse the *same* physical block object (loop_core_depth < max_loop_steps), the
+bridges cannot live on the block itself (that would collapse multiple distinct
+bridges into one, the way HiVG's literal CLIPEncoderLayer_with_Crossmodal_Bridge
+attaches one bridge per distinct CLIP layer) -- they are instead held externally
+in an nn.ModuleList keyed by injection slot, and applied by this wrapper's
 block-execution loop. Mirrors the pattern already validated in clip-kd-snn's
 src/downstream/models/hivg_loopvit.py.
 """
@@ -27,7 +30,7 @@ if _REPO_ROOT not in sys.path:
 import torch
 import torch.nn as nn
 
-from src.downstream.models.hilora import patch_block_with_lora, set_lora_trainable
+from src.downstream.models.hilora import blocks_for_stage, patch_block_with_lora, set_lora_trainable
 from src.downstream.models.macb import MACB
 from src.downstream.utils.checkpoint_io import load_submodule_from_lightning_ckpt
 from src.models.visual_encoders.loopvit import LoopViT
@@ -80,7 +83,10 @@ class LoopViTVisionWithBridge(nn.Module):
     def __init__(self, args, extract_text_layer: list[int], text_hidden_size: int) -> None:
         super().__init__()
         embed_dim = 768
+        loop_core_depth = int(getattr(args, "loopvit_loop_core_depth", 1))
         max_loop_steps = int(getattr(args, "loopvit_max_loop_steps", 12))
+        loop_mode = str(getattr(args, "loopvit_loop_mode", "global"))
+        loop_schedule = getattr(args, "loopvit_loop_schedule", None)
 
         self.loopvit = LoopViT(
             img_size=args.imsize,
@@ -91,13 +97,14 @@ class LoopViTVisionWithBridge(nn.Module):
             num_heads=12,
             mlp_ratio=4.0,
             dropout=0.0,
-            loop_core_depth=1,
+            loop_core_depth=loop_core_depth,
             max_loop_steps=max_loop_steps,
             min_loop_steps=1,
             add_step_embeddings=False,
             use_exit_gate=False,
             swiglu=False,
-            loop_mode="global",
+            loop_mode=loop_mode,
+            loop_schedule=loop_schedule,
         )
         self.config = _VisionConfig(embed_dim)
 
@@ -116,16 +123,29 @@ class LoopViTVisionWithBridge(nn.Module):
         if loopvit_checkpoint:
             load_submodule_from_lightning_ckpt(loopvit_checkpoint, self.loopvit, "visual", strict=True)
 
-    def patch_lora(self, rank: int, alpha: float, trainable: bool) -> None:
-        """Single LoRA adapter (q/k/v/out_proj) on the one shared TransformerBlock.
+    def iter_blocks(self):
+        yield from self.loopvit.iter_blocks()
 
-        loop_core_depth=1: every block-execution reuses the same nn.Module, so
-        there is exactly one unique block to patch.  Text tower is handled by
-        set_HiLoRA in HiVG.py after this call.
+    def patch_lora_stage(self, stage: int, rank: int, alpha: float) -> None:
+        """Cumulative HiLoRA staging: one adapter per unique physical block,
+        unlocked progressively across stages 1/2/3 (0 = no LoRA).
+
+        Mirrors StandardViTVisionWithBridge.patch_lora_stage exactly, via the
+        same blocks_for_stage() generalization (dedups blocks by identity in
+        first-execution order, splits cumulatively -- 5/8/12 for 12 unique
+        blocks, an even cumulative split otherwise, e.g. 1/2/3 for
+        loop_core_depth=3, 2/4/6 for loop_core_depth=6). At loop_core_depth=1
+        this is behavior-preserving relative to the old single-block
+        patch_lora(): blocks_for_stage() returns the same one block at every
+        stage >= 1. Text tower is handled by set_HiLoRA in HiVG.py after this
+        call.
         """
-        block = next(self.loopvit.iter_blocks())
-        patch_block_with_lora(block, rank=rank, alpha=alpha, dropout=0.1)
-        set_lora_trainable([block], trainable)
+        if stage == 0:
+            return
+        active_blocks = blocks_for_stage(self, stage)
+        for block in active_blocks:
+            patch_block_with_lora(block, rank=rank, alpha=alpha, dropout=0.1)
+        set_lora_trainable(active_blocks, True)
 
     def forward(
         self,
