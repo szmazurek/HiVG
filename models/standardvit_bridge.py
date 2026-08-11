@@ -18,11 +18,12 @@ loading its checkpoint here needs no key remapping at all -- `self.visual` below
 is the exact same class, so `load_submodule_from_lightning_ckpt` matches
 'model.visual.*' keys 1:1.
 
-LoRA: open_clip's ResidualAttentionBlock uses a fused nn.MultiheadAttention
-(reads in_proj_weight/out_proj as raw tensors inside forward(), bypassing any
-submodule wrapping), so only the MLP projections are LoRA-patchable -- a
-documented limitation of hilora.py's `_patch_openclip_block`, reused here as-is
-rather than re-implemented. Unlike LoopViT (loop_core_depth=1, one shared block,
+LoRA: open_clip's ResidualAttentionBlock uses a fused nn.MultiheadAttention, so
+hilora.py's `_patch_openclip_block` swaps it for `_UnfusedOpenCLIPAttention`,
+which splits in_proj_weight into q/k/v LoRALinear plus out_proj and reimplements
+forward via F.scaled_dot_product_attention. The adapted scope is therefore
+q_proj/k_proj/v_proj/out_proj -- identical to the HF-CLIP path and to HiVG's
+authors' target_modules, not MLP-only. Unlike LoopViT (loop_core_depth=1, one shared block,
 so HiVG's hierarchical 3-stage curriculum is degenerate), this backbone has 12
 distinct blocks, so the genuine cumulative HiLoRA staging (5/8/12 blocks at
 stages 1/2/3) applies via hilora.py's blocks_for_stage -- same helper the native
@@ -84,7 +85,13 @@ class StandardViTVisionWithBridge(nn.Module):
         super().__init__()
         embed_dim = 768
 
-        self.visual = open_clip.create_model("ViT-B-16", pretrained=None).visual
+        # arch is configurable so a known-good CLIP can be pushed through this exact
+        # code path as a control. clip-kd-snn's students are plain-GELU "ViT-B-16";
+        # OpenAI/DFN2B weights are QuickGELU and need "ViT-B-16-quickgelu", which has
+        # identical parameter shapes but a different activation -- loading one into
+        # the other is silent and merely wrong.
+        arch = getattr(args, "standardvit_arch", "ViT-B-16")
+        self.visual = open_clip.create_model(arch, pretrained=None).visual
         self.config = _VisionConfig(embed_dim)
 
         self.bridges = nn.ModuleList([
@@ -94,9 +101,25 @@ class StandardViTVisionWithBridge(nn.Module):
                 n_text_layers=len(extract_text_layer),
                 text_seq_len=77,
                 num_heads=8,
+                # opt-in: start the bridge as a no-op so it cannot perturb the
+                # frozen backbone's residual stream before it has learned anything
+                zero_init=bool(getattr(args, "macb_zero_init", False)),
+                text_ln=bool(getattr(args, "macb_text_ln", False)),
+                # opt-in: reproduce HiVG.py:452's transposed cross-attention input,
+                # so the port can be run in the regime the paper's numbers came from
+                hivg_layout=bool(getattr(args, "macb_hivg_layout", False)),
+                text_const=bool(getattr(args, "macb_text_const", False)),
             )
             for _ in range(len(_BRIDGE_EXECS))
         ])
+
+        # Ablation: skip the bridge injection entirely, the equivalent of HiVG's
+        # "MACB off" row (an empty adapt_layer). The modules are still constructed but
+        # never called, so they receive no gradient and contribute nothing -- neither
+        # capacity nor cross-modal signal.
+        self.macb_disable = bool(getattr(args, "macb_disable", False))
+        if self.macb_disable:
+            print("[StandardViT-Distilled] MACB DISABLED -- no cross-modal bridge injection")
 
         standardvit_checkpoint = getattr(args, "standardvit_checkpoint", "")
         if standardvit_checkpoint:
@@ -142,7 +165,7 @@ class StandardViTVisionWithBridge(nn.Module):
         exec_idx = 0
         for block in self.visual.transformer.resblocks:
             exec_idx += 1
-            if exec_idx in _EXEC_SLOT:
+            if exec_idx in _EXEC_SLOT and not self.macb_disable:
                 slot = _EXEC_SLOT[exec_idx]
                 attn_out = block.ls_1(block.attention(q_x=block.ln_1(hidden_states)))
                 hidden_states = hidden_states + attn_out

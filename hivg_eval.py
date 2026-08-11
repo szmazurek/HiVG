@@ -133,6 +133,65 @@ def get_args_parser():
                         help='rank of the StandardViT-Distilled HiLoRA adapters')
     parser.add_argument('--standardvit_lora_alpha', default=16.0, type=float,
                         help='alpha of the StandardViT-Distilled HiLoRA adapters')
+    # These three mirror hivg_train.py exactly (this file has its own duplicate
+    # parser). Both change the module graph, so an eval that omits them builds a
+    # different model than the one being evaluated and silently loads nothing
+    # into the text tower / mis-shaped MACB weights (state_dict load is
+    # strict=False upstream).
+    parser.add_argument('--distilled_text_tower', default=False, action='store_true',
+                        help="with --model StandardViT-Distilled: also replace the OpenAI HF "
+                             "CLIPTextModel with the open_clip-native text tower. Must match the "
+                             "training run's setting.")
+    parser.add_argument('--standardtext_checkpoint', default='', type=str,
+                        help="optional: distilled text tower from a different Lightning .ckpt than "
+                             "--standardvit_checkpoint. Empty (default) reuses it.")
+    parser.add_argument('--extract_text_layer', default=None,
+                        type=lambda s: [int(x) for x in s.split(',')] if s else None,
+                        help="comma-separated 1-indexed text layers feeding the MACB bridges. "
+                             "Must match the training run's setting.")
+    parser.add_argument('--ml_visual_ln', default=False, action='store_true',
+                        help="apply the vision backbone's final LayerNorm to the extracted "
+                             "hidden states before ml_visual_projection. That projection is "
+                             "initialised by tiling visual_projection, which expects post-LN "
+                             "features; without this a backbone with larger pre-LN activations "
+                             "produces fusion-transformer visual tokens that swamp the text "
+                             "tokens and drown vl_pos_embed. Must match between train and eval.")
+    parser.add_argument('--standardvit_arch', default='ViT-B-16', type=str,
+                        help="open_clip architecture name for the StandardViT-Distilled "
+                             "backbone/text tower. clip-kd-snn students are plain-GELU "
+                             "'ViT-B-16'; OpenAI/DFN2B checkpoints are 'ViT-B-16-quickgelu'. "
+                             "Shapes are identical either way, so a mismatch loads silently.")
+    parser.add_argument('--macb_zero_init', default=False, action='store_true',
+                        help="zero-initialise the MACB cross-modal bridge output projection so "
+                             "the bridge starts as an exact no-op (standard adapter practice). "
+                             "Without it the randomly-initialised bridge inflates the frozen "
+                             "backbone's residual stream ~20x relative to HiVG's own in-layer "
+                             "cross module, drowning vl_pos_embed. Must match between train/eval.")
+    parser.add_argument('--clip_hidden_act', default='', type=str,
+                        help="override the HF CLIP config activation ('gelu') when loading a "
+                             "non-QuickGELU checkpoint through --clip_model on the native path. "
+                             "openai/clip-vit-base-patch16 is quick_gelu; clip-kd-snn students "
+                             "are plain GELU and load silently wrong without this.")
+    parser.add_argument('--macb_text_ln', default=False, action='store_true',
+                        help="LayerNorm each text hidden state before MACB concatenates them. "
+                             "Only meaningful when extract_text_layer has >1 entry, which is "
+                             "exactly the configuration that fails. Must match train/eval.")
+    parser.add_argument('--macb_hivg_layout', default=False, action='store_true',
+                        help="Reproduce HiVG.py:452's permute(1,0,2) on the cross-attention "
+                             "text input. HiVG feeds (L,B,D) to a module documented as "
+                             "(B,L,D); the subsequent .view() succeeds silently and scrambles "
+                             "the batch/token axes. Off = our layout-correct behaviour. "
+                             "Must match train/eval.")
+    parser.add_argument('--macb_disable', default=False, action='store_true',
+                        help="Ablation: skip the cross-modal bridge injection entirely "
+                             "(equivalent of HiVG's MACB-off ablation row). Must match train/eval.")
+    parser.add_argument('--macb_text_const', default=False, action='store_true',
+                        help="Ablation: feed the bridge a learned constant instead of text, "
+                             "keeping all 49M bridge params. Separates adapter capacity from "
+                             "cross-modal conditioning. Must match train/eval.")
+    parser.add_argument('--disable_adapt_layer', default=False, action='store_true',
+                        help="Ablation: empty adapt_layer so no MACB bridge is built at all "
+                             "(HiVG's own MACB-off configuration). Must match train/eval.")
     parser.add_argument('--bert_model', default='bert-base-uncased', type=str, help='bert model')
     parser.add_argument('--light', dest='light', default=False, action='store_true', help='if use smaller model')
     parser.add_argument('--start_epoch', default=0, type=int, metavar='N', help='start epoch')

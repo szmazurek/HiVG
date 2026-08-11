@@ -115,6 +115,11 @@ class LoopViTVisionWithBridge(nn.Module):
                 n_text_layers=len(extract_text_layer),
                 text_seq_len=77,
                 num_heads=8,
+                # opt-in: start the bridge as a no-op so it cannot perturb the
+                # frozen backbone's residual stream before it has learned anything
+                zero_init=bool(getattr(args, "macb_zero_init", False)),
+                text_ln=bool(getattr(args, "macb_text_ln", False)),
+                hivg_layout=bool(getattr(args, "macb_hivg_layout", False)),
             )
             for _ in range(len(_BRIDGE_EXECS))
         ])

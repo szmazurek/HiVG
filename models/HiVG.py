@@ -19,6 +19,7 @@ import math
 from .loopvit_bridge import LoopViTVisionWithBridge, load_visual_projection_from_lightning_ckpt
 from .standardvit_bridge import StandardViTVisionWithBridge, load_visual_proj_from_standard_ckpt
 from .looptext_bridge import LoopTextWithBridge
+from .standardtext_bridge import StandardTextWithBridge, load_text_proj_from_standard_ckpt
 
 # loopvit_bridge already added _REPO_ROOT to sys.path as a side-effect of import
 from src.downstream.models.hilora import patch_block_with_lora as _hil_patch, set_lora_trainable as _hil_set_trainable
@@ -711,7 +712,19 @@ class HiVG(nn.Module):
             self.patch_size = 16
         else:  # default base model
             print("init CLIP ViT-B/16")
-            self.clip = CLIPModel.from_pretrained("openai/clip-vit-base-patch16")
+            # --clip_hidden_act lets a plain-GELU backbone (this repo's CLIP-KD
+            # students) use the native path. The HF hub config for
+            # openai/clip-vit-base-patch16 is quick_gelu, and loading GELU-trained
+            # weights under it is silent and simply wrong -- shapes are identical.
+            _act = getattr(args, "clip_hidden_act", "")
+            if _act:
+                _cfg = CLIPConfig.from_pretrained("openai/clip-vit-base-patch16")
+                _cfg.text_config.hidden_act = _act
+                _cfg.vision_config.hidden_act = _act
+                self.clip = CLIPModel(_cfg)
+                print(f"init CLIP ViT-B/16 with hidden_act={_act} (weights come from --clip_model)")
+            else:
+                self.clip = CLIPModel.from_pretrained("openai/clip-vit-base-patch16")
             """
              Note that there is no mistake here. Note that [1, 4, 8, 12], [0, 3, 7, 11] are the same layer.
              In the internal implementation of transformers, the index at vision branch [0] is the original
@@ -737,12 +750,45 @@ class HiVG(nn.Module):
             else:
                 self.extract_text_layer = [12]
 
+        # CLI override, applied last so it wins over both the mixup_pretrain and
+        # the per-dataset branch above. Lets the same dataset be run with
+        # different bridge widths (e.g. gref_umd with [12] instead of [1..12])
+        # to separate "how much text is fed to MACB" from "which dataset".
+        # Changing this changes MACB's parameter shapes (cross_gate is
+        # Linear(text_dim * len(extract_text_layer), 768)), so checkpoints are
+        # not interchangeable across settings and the value must stay constant
+        # across all four HiLoRA phases of a curriculum.
+        override = getattr(args, "extract_text_layer", None)
+        if override:
+            if not all(1 <= i <= 12 for i in override):
+                raise ValueError(
+                    f"--extract_text_layer entries must be in 1..12, got {override}")
+            self.extract_text_layer = list(override)
+            print("extract_text_layer overridden from CLI: ", self.extract_text_layer)
+
         print("\nextract vision layer: ", self.extract_vision_layer)
         print("extract text layer: ", self.extract_text_layer)
         print("image size: ", args.imsize, " * ", args.imsize)
 
         for parameter in self.clip.parameters():
             parameter.requires_grad_(False)
+
+        # Ablation (--disable_adapt_layer): empty adapt_layer, which is HiVG's own
+        # "MACB off" configuration -- CLIPEncoderLayer_with_Crossmodal_Bridge gates
+        # construction of cross_norm/cross_attn/cross_mlp/cross_gate/
+        # cross_adaptive_weights on `if i in adapt_layer` (:394), and forward gates
+        # injection on `if layer in adapt_layer` (:439), so an empty list removes the
+        # bridge entirely rather than merely bypassing it. Upstream already relies on
+        # this path (`[] if args.warmup is True` at :673), so it is a supported state.
+        #
+        # Exists to test HiVG's own ablation row: they report MACB worth +3.05 val /
+        # +2.76 test (73.48/73.01 -> 76.53/75.77), but their negative row removes
+        # capacity AND cross-modality together, and their bridge receives only
+        # 0.65% own-caption keys (see analysis_out/SUMMARY.md §5). This reproduces
+        # row 1 vs row 2 on the native path with everything else held fixed.
+        if getattr(args, "disable_adapt_layer", False):
+            self.adapt_layer = []
+            print("[ablation] --disable_adapt_layer: adapt_layer emptied, no MACB built")
 
         print("adapt_layer: ", self.adapt_layer)
         if args.model == "LoopViT":
@@ -760,8 +806,13 @@ class HiVG(nn.Module):
             if loopvit_checkpoint:
                 load_visual_projection_from_lightning_ckpt(loopvit_checkpoint, self.clip.visual_projection)
         elif args.model == "StandardViT-Distilled":
+            # Hoisted rather than read from self.clip.text_model.config.hidden_size:
+            # under --distilled_text_tower that tower is replaced below, and the
+            # open_clip replacement has no HF `.config`. 512 for ViT-B/16 either
+            # way. Mirrors the LoopViT-LoopText branch's comment below.
+            text_hidden_size = 512
             self.clip.vision_model = StandardViTVisionWithBridge(
-                args, self.extract_text_layer, self.clip.text_model.config.hidden_size
+                args, self.extract_text_layer, text_hidden_size
             )
             # The blanket freeze above ran against the now-discarded
             # pretrained CLIPVisionModel -- freeze the new backbone explicitly
@@ -771,6 +822,19 @@ class HiVG(nn.Module):
             standardvit_checkpoint = getattr(args, "standardvit_checkpoint", "")
             if standardvit_checkpoint:
                 load_visual_proj_from_standard_ckpt(standardvit_checkpoint, self.clip.visual_projection)
+            if getattr(args, "distilled_text_tower", False):
+                # Default off: the CLIPModel above keeps supplying the OpenAI
+                # text tower, which is the arm every existing run used. On, the
+                # student's own text tower and text_projection are transplanted
+                # so both halves of the model share one joint space -- see
+                # standardtext_bridge.py's module docstring for why that matters.
+                self.clip.text_model = StandardTextWithBridge(args)
+                # Blanket freeze above ran against the now-discarded HF tower.
+                for p in self.clip.text_model.parameters():
+                    p.requires_grad_(False)
+                if standardvit_checkpoint:
+                    load_text_proj_from_standard_ckpt(standardvit_checkpoint,
+                                                      self.clip.text_projection)
         elif args.model == "LoopViT-LoopText":
             # text_hidden_size must come from args.text_width, NOT
             # self.clip.text_model.config.hidden_size (as the "LoopViT" branch
@@ -853,6 +917,22 @@ class HiVG(nn.Module):
         self.ml_visual_projection.weight = nn.Parameter(torch.cat([self.clip.visual_projection.weight for i
                                                                    in range(len(self.extract_vision_layer))], dim=1))
 
+        # Optional (--ml_visual_ln): the backbone's own final LayerNorm, applied to
+        # the extracted hidden states before ml_visual_projection. Reuses the
+        # trained module rather than a fresh one so the arm stays weight-identical
+        # to the control apart from where that LN is applied. None = off (default).
+        self.ml_visual_ln = None
+        if getattr(args, "ml_visual_ln", False):
+            vm = self.clip.vision_model
+            for attr in ("ln_post", "post_layernorm"):       # open_clip / HF names
+                if hasattr(vm, attr):
+                    self.ml_visual_ln = getattr(vm, attr); break
+                if hasattr(vm, "visual") and hasattr(vm.visual, attr):
+                    self.ml_visual_ln = getattr(vm.visual, attr); break
+            if self.ml_visual_ln is None:
+                raise RuntimeError("--ml_visual_ln: no ln_post/post_layernorm on the vision model")
+            print("[ml_visual_ln] applying the backbone's final LayerNorm before ml_visual_projection")
+
         self.visu_token_norm = nn.LayerNorm(self.hidden_dim, eps=1e-05)  # 512, eps=1e-05
         self.visu_token_mlp = TOKEN_MLP(self.hidden_dim, 3072)  # 3072
 
@@ -910,12 +990,22 @@ class HiVG(nn.Module):
             # Vision: cumulative HiLoRA staging (5/8/12 blocks at stages 1/2/3)
             self.clip.vision_model.patch_lora_stage(args.hi_lora_stage, rank=rank, alpha=alpha)
             print(f"[StandardViT-Distilled] vision HiLoRA stage={args.hi_lora_stage} rank={rank} alpha={alpha}")
-            # Text: all 12 HF-CLIP text layers — matching authors' scope (q/k/v/out_proj)
-            text_layers = list(self.clip.text_model.encoder.layers)
-            for layer in text_layers:
-                _hil_patch(layer, rank=rank, alpha=alpha, dropout=0.1)
-            _hil_set_trainable(text_layers, args.hi_lora_stage >= 1)
-            print(f"[StandardViT-Distilled] text LoRA {len(text_layers)} layers rank={rank} alpha={alpha}")
+            # Text: all 12 layers, flat (never staged) — matching authors' scope
+            # (q/k/v/out_proj). The distilled tower is an open_clip module with
+            # no .encoder.layers, so it needs its own patch call; the HF branch
+            # stays intact as the control arm.
+            if isinstance(self.clip.text_model, StandardTextWithBridge):
+                self.clip.text_model.patch_lora_flat(rank=rank, alpha=alpha)
+                self.clip.text_model.set_trainable(args.hi_lora_stage >= 1)
+                n_text_blocks = len(self.clip.text_model.text.transformer.resblocks)
+                print(f"[StandardViT-Distilled] distilled text LoRA {n_text_blocks} blocks "
+                      f"rank={rank} alpha={alpha} trainable={args.hi_lora_stage >= 1}")
+            else:
+                text_layers = list(self.clip.text_model.encoder.layers)
+                for layer in text_layers:
+                    _hil_patch(layer, rank=rank, alpha=alpha, dropout=0.1)
+                _hil_set_trainable(text_layers, args.hi_lora_stage >= 1)
+                print(f"[StandardViT-Distilled] HF text LoRA {len(text_layers)} layers rank={rank} alpha={alpha}")
             return
 
         open_lora = True
@@ -1086,6 +1176,19 @@ class HiVG(nn.Module):
         ml_image_features = [clip_image_features["hidden_states"][i] for i in self.extract_vision_layer]
         img_cls_embed = self.clip.visual_projection(clip_image_features["pooler_output"])  # torch.Size([64, 512])
 
+        if self.ml_visual_ln is not None:
+            # ml_visual_projection is INITIALISED by tiling visual_projection
+            # (see __init__), a matrix trained to consume post-final-LayerNorm
+            # features -- but hidden_states[i] are pre-LN. OpenAI CLIP happens to
+            # have small pre-LN activations so the mismatch is invisible there;
+            # a distilled backbone's are ~5x larger, and the MACB bridges amplify
+            # further, ending with fusion-transformer visual tokens ~87x OpenAI's.
+            # At that scale vl_pos_embed (std 0.02) is negligible relative to the
+            # token it is added to, i.e. the 196 patches lose their spatial order,
+            # and the 77 text tokens are swamped ~45:1. Applying the backbone's
+            # own final LayerNorm first puts every backbone on the scale the tiled
+            # init assumes. See HiVG/analysis_out/vl_sequence_scale.csv.
+            ml_image_features = [self.ml_visual_ln(h) for h in ml_image_features]
         ml_image_features = torch.cat(ml_image_features, dim=2)
         image_features = self.ml_visual_projection(ml_image_features)
 
